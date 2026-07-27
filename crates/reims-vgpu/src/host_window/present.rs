@@ -45,7 +45,6 @@ use crate::runtime::host::HostAction;
 /// cause (verified: staging stays frozen across fullscreen/video transitions),
 /// so a trip means a real regression, not a transient.
 const REVERT_ALARM_RUN: u32 = 240;
-#[cfg(target_os = "macos")]
 const ENGINE_WINDOW_REDRAW_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 /// How long a guest-driven native resize request may stay unmatched by a
 /// winit `Resized` event before the always-on alarm names it. Live requests
@@ -592,7 +591,6 @@ pub fn run(
         first_engine_guest_logged: false,
         #[cfg(target_os = "macos")]
         engine_error_logged: false,
-        #[cfg(target_os = "macos")]
         next_engine_redraw: std::time::Instant::now(),
         #[cfg(target_os = "macos")]
         last_engine_seq: None,
@@ -751,7 +749,11 @@ struct App {
     first_engine_guest_logged: bool,
     #[cfg(target_os = "macos")]
     engine_error_logged: bool,
-    #[cfg(target_os = "macos")]
+    /// Deadline for the next periodic `request_redraw()` in `about_to_wait`.
+    /// macOS uses it alongside the native-resize handshake below; non-macOS
+    /// uses it alone as the redraw pump, since there `RedrawRequested`'s
+    /// self-chain (see the handler) can stall until an externally generated
+    /// X11 event unsticks it.
     next_engine_redraw: std::time::Instant,
     #[cfg(target_os = "macos")]
     last_engine_seq: Option<u64>,
@@ -950,6 +952,25 @@ impl ApplicationHandler for App {
                     self.engine_redraw_required = true;
                 }
             }
+            let now = std::time::Instant::now();
+            if now >= self.next_engine_redraw {
+                window.request_redraw();
+                self.next_engine_redraw = now + ENGINE_WINDOW_REDRAW_POLL;
+            }
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                self.next_engine_redraw,
+            ));
+        }
+        // Non-macOS presentation has no native-resize handshake to drive, but
+        // it still needs a redraw pump: `WindowEvent::RedrawRequested` below
+        // re-requests itself each frame, a self-chain that depends on the
+        // windowing system continuing to deliver events. Under X11 that chain
+        // can stall — observed as a live guest whose window only repaints
+        // after a click, resize, or other externally generated event unsticks
+        // it. Poll on the same cadence macOS already uses so presentation
+        // does not depend on X11 event delivery being reliable.
+        #[cfg(not(target_os = "macos"))]
+        if let Some(window) = self.window.as_ref() {
             let now = std::time::Instant::now();
             if now >= self.next_engine_redraw {
                 window.request_redraw();
