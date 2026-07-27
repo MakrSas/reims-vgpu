@@ -1894,6 +1894,61 @@ fn storage_format_specialization_preserves_raw_views_and_runtime_shape() {
     );
 }
 
+/// `metal2vulkan` lowers a generic `texture2d<float, access::write>` to SPIR-V
+/// `R32f` (enum value 3). Decoding that as `Unsupported(3)` made the format
+/// unspecializable, so every dispatch binding such an image died as
+/// `storage_format_specialize_mismatch` — 142 dropped dispatches in one x86
+/// desktop boot. It specializes exactly like the `R32ui` case: the declared
+/// format is a placeholder, the bound guest surface decides the view.
+#[cfg(feature = "backend-vulkan")]
+#[test]
+fn r32f_write_images_specialize_to_the_bound_guest_surface() {
+    use crate::backend::vulkan::engine::StorageImageFormat as V;
+    use crate::runtime::spirv_bind::ImageFormat as S;
+
+    assert_eq!(
+        spirv_image_format_to_engine_storage(S::R32Float),
+        Some(V::R32Float)
+    );
+
+    // Wider float surfaces: the placeholder widens to the guest's own format
+    // so all four written lanes are stored, not just `.x`.
+    assert_eq!(
+        specialized_storage_image_format(V::Rgba32Float, S::R32Float, true),
+        Ok(S::Rgba32Float)
+    );
+    assert_eq!(
+        specialized_storage_image_format(V::Rgba16Float, S::R32Float, true),
+        Ok(S::Rgba16Float)
+    );
+    // Narrower single-channel float: still class-matched to the guest surface.
+    assert_eq!(
+        specialized_storage_image_format(V::R16Float, S::R32Float, true),
+        Ok(S::R16Float)
+    );
+    // An R32Float guest surface is an exact match — the raw view is correct.
+    assert_eq!(
+        specialized_storage_image_format(V::R32Float, S::R32Float, true),
+        Ok(S::R32Float)
+    );
+    // BGRA8Unorm is the desktop composite target. Bytes/texel are equal (4 == 4)
+    // so the raw-view early return would view a BGRA surface as a single
+    // 32-bit float; a normalized color store must retarget instead.
+    assert_eq!(
+        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, true),
+        Ok(S::Unknown)
+    );
+    assert_eq!(
+        specialized_storage_image_format(V::Bgra8Unorm, S::R32Float, false),
+        Ok(S::Rgba8Unorm)
+    );
+    // A float-class shader over a uint surface stays a class mismatch.
+    assert_eq!(
+        specialized_storage_image_format(V::R32Uint, S::R32Float, true),
+        Err("spirv_guest_numeric_class_mismatch")
+    );
+}
+
 /// x86 (12-bit) task page table with depth-1 root; ptes map gva page i →
 /// `pfns[i]`. Mirrors the gva_view multi-import fixture.
 fn setup_linear_task_x86(host: &mut FakeHost, state: &mut DeviceState, pfns: &[u32]) {

@@ -4441,6 +4441,7 @@ fn spirv_image_format_to_engine_storage(
         S::R8Unorm => V::R8Unorm,
         S::Rg8Unorm => V::Rg8Unorm,
         S::Rgba32Uint => V::Rgba32Uint,
+        S::R32Float => V::R32Float,
         S::R32ui => V::R32Uint,
         // Format-less (`Unknown`) storage images carry no engine texel format —
         // their view format comes from the guest surface, resolved by the caller.
@@ -4481,6 +4482,7 @@ fn specialized_storage_image_format(
                 | S::Rgba32Float
                 | S::Rgba16Float
                 | S::R16Float
+                | S::R32Float
                 | S::Rg16Float
                 | S::R8Unorm
                 | S::Rg8Unorm
@@ -4512,6 +4514,7 @@ fn specialized_storage_image_format(
         S::Rgba32Float
         | S::Rgba16Float
         | S::R16Float
+        | S::R32Float
         | S::Rgba8Unorm
         | S::Rg16Float
         | S::R8Unorm

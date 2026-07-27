@@ -149,6 +149,14 @@ pub enum ImageFormat {
     R8Unorm,
     Rg8Unorm,
     Rgba32Uint,
+    /// Single-channel 32-bit float (SPIR-V `R32f`, enum value 3). This is what
+    /// `metal2vulkan` declares for a generic `texture2d<float, access::write>`
+    /// (`storage_format_from_name`: a `<float` scalar lowers to `R32f`), so it
+    /// arrives on the wire constantly — a full-width float write target whose
+    /// real texel format is whatever guest surface gets bound. Like [`Self::R32ui`]
+    /// it is specialized against that surface before use; leaving it undecoded
+    /// made every such dispatch `Unsupported(3)` and dropped it.
+    R32Float,
     /// Single-channel 32-bit uint (SPIR-V `R32ui`). Not emitted by the
     /// translator (which declares `Rgba8ui` for a generic `texture2d<uint,
     /// write>`); the device *specializes* a storage image to this format when
@@ -173,6 +181,7 @@ impl ImageFormat {
             0 => Self::Unknown,
             1 => Self::Rgba32Float,
             2 => Self::Rgba16Float,
+            3 => Self::R32Float,
             4 => Self::Rgba8Unorm,
             7 => Self::Rg16Float,
             9 => Self::R16Float,
@@ -191,6 +200,7 @@ impl ImageFormat {
         match self {
             Self::Rgba32Float => 1,
             Self::Rgba16Float => 2,
+            Self::R32Float => 3,
             Self::Rgba8Unorm => 4,
             Self::Rg16Float => 7,
             Self::R16Float => 9,
@@ -1807,6 +1817,40 @@ mod tests {
             Ok(1)
         );
         assert_eq!(image_format(&words, 33), Some(ImageFormat::R32ui));
+    }
+
+    /// SPIR-V `R32f` is enum value 3 and is what `metal2vulkan` declares for a
+    /// generic `texture2d<float, access::write>`. Leaving 3 out of the decode
+    /// table turned every such storage image into `Unsupported(3)`, which the
+    /// device cannot specialize — the dispatch was dropped rather than run
+    /// against the bound guest surface.
+    #[test]
+    fn r32f_write_image_decodes_and_specializes() {
+        let mut words = vec![0x0723_0203, 0x0001_0000, 0, 6, 0];
+        // OpTypeImage %1 : float 2D depth=0 arrayed=0 ms=0 sampled=2 format=3.
+        words.extend([
+            (9u32 << 16) | OP_TYPE_IMAGE as u32,
+            1,
+            99,
+            1,
+            0,
+            0,
+            0,
+            2,
+            3,
+        ]);
+        words.extend([(4u32 << 16) | OP_TYPE_POINTER as u32, 2, 0, 1]);
+        words.extend([(4u32 << 16) | OP_VARIABLE as u32, 2, 3, 0]);
+        words.extend([(4u32 << 16) | OP_DECORATE as u32, 3, DECORATION_BINDING, 33]);
+
+        assert_eq!(ImageFormat::from_raw(3), ImageFormat::R32Float);
+        assert_eq!(ImageFormat::R32Float.raw(), 3);
+        assert_eq!(image_format(&words, 33), Some(ImageFormat::R32Float));
+        assert_eq!(
+            specialize_image_formats(&mut words, &[(33, ImageFormat::Rgba32Float)]),
+            Ok(1)
+        );
+        assert_eq!(image_format(&words, 33), Some(ImageFormat::Rgba32Float));
     }
 
     fn storage_buffer_module(binding: u32) -> Vec<u32> {
