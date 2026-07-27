@@ -1,6 +1,81 @@
-# reims-vgpu
+# reims-vgpu — Linux x86 / AMD RADV fork
 
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0%20or%20later-blue.svg)](LICENSE)
+
+Fork of [steelbrain/reims-vgpu](https://github.com/steelbrain/reims-vgpu) used to bring the
+**x86 macOS / Linux Vulkan** pathway up on an AMD integrated GPU under Mesa RADV, and to fix what
+that bring-up turned up. Upstream's own description follows [below](#upstream-project); this first
+section is specific to the fork.
+
+Work here targets that one pathway. arm64, Metal, and MoltenVK are untouched and unmeasured —
+nothing claimed here generalises to them.
+
+## The bench
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 5 5560U (6C/12T) |
+| GPU | Radeon Vega, Cezanne/Renoir (`1002:1638`) — Mesa 25.2.8 RADV, Vulkan 1.4 |
+| RAM | 16 GiB, **512 MiB swap** |
+| OS | Ubuntu 24.04.4, kernel 6.17, KDE Plasma on **X11** |
+| Filesystem | ext4 — no reflink, so every snapshot boot copies the whole guest disk |
+| Guest | macOS 13.7.8 Ventura, 4 GiB RAM, provisioned via OSX-KVM |
+
+The X11 session and the small swap both matter: two of the findings below exist because of them.
+
+## Status
+
+The guest boots to a working desktop with `Apple Paravirtualized Graphics Device` bound — Dock,
+windows, and input all function. It is not smooth yet, and some texture content is wrong. Measured
+rather than eyeballed:
+
+- **Works:** boot to desktop, real GPU acceleration, keyboard and mouse, no import declines, no
+  present-capture failures.
+- **Does not:** Dock icons render as flat colour blocks and the wallpaper stays black
+  (`storage_format_specialize_mismatch`, `compute_stage_tex type11_fail`); interactive response is
+  uneven, now dominated by command submission rather than by the memory path.
+
+Numbers and remaining leads: [`docs/linux-x86-radv.md`](docs/linux-x86-radv.md).
+
+## What this fork changes
+
+1. **`vm/boot-x86.sh`: default `WAYLAND_DISPLAY` only when a Wayland socket exists.** winit selects
+   Wayland whenever that variable is non-empty, without checking that the socket is real, so on an
+   X11-only host the launcher's own default forced a backend that could not start and the window
+   silently never appeared.
+
+2. **The host-import budget bounds a working set, not a lifetime.**
+   `HOST_IMPORT_TOTAL_BYTE_CAP` equalled a single window and `host_imports` never shrank, so the
+   first import spent the whole budget permanently and every later bucket fell to the CPU scatter
+   path for the rest of the session. The cap now admits several windows and evicts the coldest
+   through the existing in-flight-safe deferral. On a ~158-draw tranche: **1.65–3.5 s → ~0.45 s**,
+   `zc_fail_import` **1158 per tranche → 0**.
+
+3. **Pathway notes** under `docs/`.
+
+## Running it here
+
+`llvm-dis` must be reachable, or `metal2vulkan` cannot disassemble AIR and *every* draw degrades to
+a clear — a black screen with a healthy-looking log and no obvious cause. Ubuntu ships it
+versioned:
+
+```bash
+sudo apt install llvm-18
+```
+
+Then boot with the guest sized to fit the import budget — guest RAM above the byte cap thrashes,
+see the notes doc:
+
+```bash
+RAM=4G METAL2VULKAN_LLVM_DIS=/usr/bin/llvm-dis-18 sg kvm -c './vm/boot-x86.sh --device reims-vgpu-pci --interactive'
+```
+
+Diagnostics land in `/tmp/reims-vgpu-fail.log`. The `drain_tranche_us=` lines are the useful ones:
+each breaks a batch of draws down into import, setup, engine, and submit time.
+
+---
+
+# Upstream project
 
 > **Alpha.** This project is early and under active development. The QEMU device ABI, boot scripts,
 > crate layout, backend behavior, and supported host/guest pathways may change without a stable
