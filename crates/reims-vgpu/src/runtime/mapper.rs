@@ -14,6 +14,7 @@ use crate::contract::iosurface_pages::{
     MAPPER_REQUEST_MAP, MAPPER_REQUEST_UNMAP,
 };
 use crate::model::{DeviceState, MapperCapture, MAX_MAPPINGS};
+use crate::runtime::decode::resource::OBJECT_LIST_ENTRY_LEN;
 use crate::runtime::host::{HostMemory, HostOps, MemError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1052,7 +1053,7 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
             }
         }
     }
-    for task in &state.tasks {
+    for (task_idx, task) in state.tasks.iter().enumerate() {
         if !task.active {
             continue;
         }
@@ -1064,11 +1065,43 @@ fn first_control_page_collision(state: &DeviceState, gpas: &[u64]) -> Option<(u6
         }
         if task.object_list_pfn != 0 {
             let first = (task.object_list_pfn as u64) << state.page_shift;
-            let bytes = (task.object_list_count as u64).saturating_mul(16);
-            let count = bytes.saturating_add(page - 1) / page;
+            // Reserve only up to the highest `ref` this task has actually
+            // registered (`state.objects`, the host's live registry), not the
+            // full advertised `object_list_count`. A live task can advertise
+            // up to one million slots — the guest's headroom for future
+            // registrations, not a claim that all of it is populated.
+            // Reserving the whole advertised capacity as one fixed 16 MiB dead
+            // zone at the low end of guest RAM declined unrelated real
+            // surfaces wholesale: 325 collisions across a boot, 20+ distinct
+            // mappings, most of the desktop never composited (icons, windows,
+            // wallpaper). `ref` is the surface_id on the type-4 present path
+            // (see the module doc), so the live high-water mark is exactly
+            // what future entries can already alias — nothing past it is live
+            // yet.
+            let task_id = task_idx as u32;
+            let live_end = state
+                .objects
+                .range((task_id, 0)..(task_id.saturating_add(1), 0))
+                .next_back()
+                .map(|(&(_, max_ref), _)| {
+                    (max_ref as u64).saturating_add(1) * OBJECT_LIST_ENTRY_LEN as u64
+                })
+                .unwrap_or(0);
+            let count = live_end.saturating_add(page - 1) / page;
             for i in 0..count {
                 let gpa = first.saturating_add(i.saturating_mul(page));
                 if contains(gpa) {
+                    // The refusal names the colliding page; without the claim
+                    // behind it there is no way to tell a real transport-page
+                    // alias from an object list whose advertised slot count
+                    // reserves far more guest RAM than it populates.
+                    crate::observe::off(format!(
+                        "control_page_claim owner=task_object_list gpa={gpa:#x} \
+                         list_base={first:#x} live_end={live_end:#x} pages={count} \
+                         advertised_slots={} list_end={:#x}",
+                        task.object_list_count,
+                        first.saturating_add(count.saturating_mul(page))
+                    ));
                     return Some((gpa, "task_object_list"));
                 }
             }
@@ -2068,6 +2101,12 @@ mod tests {
         state.child_rings[2].page_gpas = vec![0x330_000];
         assert!(state.define_task(1, 0x4000_0000, 0x440));
         assert!(state.set_object_list(1, 0x550, 1024));
+        // ref=341 is the lowest ref whose 12-byte entry lands in the object
+        // list's second page (0x550000 + 0x1000): offset 341*12=4092..4104
+        // crosses the 4096 page boundary. Registering it is what makes
+        // 0x551_000 live — see the reservation test below for the case where
+        // nothing is registered.
+        assert!(state.insert_object(1, 341, crate::model::ObjectEntry::default()));
 
         assert_eq!(
             first_control_page_collision(&state, &[0x120_000]),
@@ -2086,5 +2125,35 @@ mod tests {
             Some((0x551_000, "task_object_list"))
         );
         assert_eq!(first_control_page_collision(&state, &[0x660_000]), None);
+    }
+
+    /// The bug this closes: the reservation used to span `object_list_count`
+    /// (the guest's advertised ceiling — observed at 1,048,576, a 16 MiB dead
+    /// zone) regardless of how many refs were actually live. A live task with
+    /// zero registered objects reserved the same 16 MiB as one with a full
+    /// desktop's worth, declining unrelated real surfaces that merely landed
+    /// inside the advertised-but-unpopulated range. The reservation must
+    /// track `state.objects`, the host's actual live registry, not the
+    /// guest's ceiling.
+    #[test]
+    fn object_list_reservation_tracks_live_refs_not_advertised_capacity() {
+        let mut state = DeviceState::new(DeviceId(1), crate::model::PAGE_SHIFT_X86);
+        assert!(state.define_task(1, 0x4000_0000, 0));
+        // The advertised ceiling used in the pre-fix code (DEFAULT_OBJECT_LIST_COUNT).
+        assert!(state.set_object_list(1, 0x1, 1_048_576));
+
+        // No object registered yet: nothing in the advertised range is live,
+        // so a real surface anywhere in it — even one page in — must not
+        // collide.
+        assert_eq!(first_control_page_collision(&state, &[0x2_000]), None);
+
+        // Registering ref=0 makes only its own page live.
+        assert!(state.insert_object(1, 0, crate::model::ObjectEntry::default()));
+        assert_eq!(
+            first_control_page_collision(&state, &[0x1_000]),
+            Some((0x1_000, "task_object_list"))
+        );
+        // A page far past the one live entry is still free.
+        assert_eq!(first_control_page_collision(&state, &[0x100_000]), None);
     }
 }
