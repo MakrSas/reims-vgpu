@@ -426,10 +426,18 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # per-login random suffix; override any of these in the environment if yours
   # differ (e.g. a different seat, DISPLAY, or Wayland socket).
   : "${XDG_RUNTIME_DIR:=/run/user/1000}"
-  : "${WAYLAND_DISPLAY:=wayland-0}"
+  # winit's Linux backend picks Wayland whenever WAYLAND_DISPLAY is a non-empty
+  # string, regardless of whether that socket actually exists (see winit
+  # platform_impl/linux/mod.rs EventLoop::new). Defaulting it unconditionally
+  # therefore forces Wayland (and a silent, unlogged EventLoopError) on
+  # X11-only hosts. Only default it when a real Wayland socket is present.
+  if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -S "$XDG_RUNTIME_DIR/wayland-0" ]; then
+    WAYLAND_DISPLAY="wayland-0"
+  fi
   : "${DISPLAY:=:0}"
   : "${XAUTHORITY:=/run/user/1000/xauth_Kmhxwx}"
-  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY XAUTHORITY
+  export XDG_RUNTIME_DIR DISPLAY XAUTHORITY
+  [ -n "${WAYLAND_DISPLAY:-}" ] && export WAYLAND_DISPLAY || unset WAYLAND_DISPLAY
 else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
