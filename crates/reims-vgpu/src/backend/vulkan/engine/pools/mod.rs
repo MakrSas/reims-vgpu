@@ -148,10 +148,15 @@ pub(crate) struct ResourcePools {
     storage_recycle_admits: u64,
     storage_recycle_cap_drops: u64,
     /// VK_EXT_external_memory_host imports over guest-RAM host VAs (direct
-    /// RAMBlock aliases — stable for the VM lifetime, so entries are never
-    /// evicted; freed only at teardown). Each entry carries a TRANSFER_SRC
-    /// buffer bound over the whole import for zero-copy guest gathers.
+    /// RAMBlock aliases — stable for the VM lifetime). Each entry carries a
+    /// TRANSFER_SRC buffer bound over the whole import for zero-copy guest
+    /// gathers. The byte/count caps bind a working set: past them the coldest
+    /// entries are evicted through the in-flight-safe deferral, so a long
+    /// session keeps importing the windows the guest is actually touching.
     host_imports: Vec<HostImportRegion>,
+    /// Monotonic stamp source for `HostImportRegion::last_used`. Counts
+    /// resolves, not wall time — eviction only needs the ordering.
+    host_import_clock: u64,
     /// One-shot guards for fail-visible import-budget declines.
     host_import_count_cap_logged: bool,
     host_import_zero_len_logged: bool,
@@ -208,6 +213,10 @@ pub(crate) struct HostImportRegion {
     len: u64,
     memory: vk::DeviceMemory,
     buffer: vk::Buffer,
+    /// `host_import_clock` stamp of the last resolve that hit this region.
+    /// Eviction takes the coldest stamp, so a window the guest still touches
+    /// every frame outlives the buckets it merely passed through at boot.
+    last_used: u64,
 }
 
 /// Arm's retained `mach_vm_remap` views are separate small VM regions, so a
@@ -216,7 +225,39 @@ pub(crate) struct HostImportRegion {
 /// objects while the byte cap prevents many maximum-size windows from pinning
 /// the guest's whole RAM allocation.
 const HOST_IMPORT_REGION_CAP: usize = 512;
-const HOST_IMPORT_TOTAL_BYTE_CAP: u64 = HOST_IMPORT_WINDOW_CAP;
+
+/// Maximum-size windows the byte cap admits over the device's lifetime.
+///
+/// `host_imports` is append-only until teardown (no eviction), so this is a
+/// lifetime budget, not a working-set bound. At one window the budget is spent
+/// by the first import and **no second bucket can ever resolve**: every span
+/// outside that one window declines with `host_import_total_byte_cap` and falls
+/// to the CPU scatter path for the rest of the boot. Measured on an x86 Ventura
+/// guest (6 GiB RAM, RADV): one 1 GiB region imported, the next bucket refused,
+/// then `zc_fail_import=264` and `store_scatter_fallback class=run_unimportable`
+/// per tranche with `drain_tranche_us` at 1.7 s — a desktop that renders but
+/// cannot keep up. A guest's live surfaces span several VMA-relative buckets, so
+/// the window resolver's documented steady state ("a handful of windows") needs
+/// a budget of more than one to exist at all.
+///
+/// Sixteen 256 MiB windows hold the pinning at 4 GiB — the same total the
+/// 1 GiB-window budget allowed, spent on four times as many distinct hot
+/// regions.
+///
+/// What must not grow is the product. Raising the budget to cover a guest's
+/// whole RAM (six 1 GiB windows against a 6 GiB x86 guest) pinned the entire
+/// guest allocation: the host (16 GiB, 512 MiB swap) had nothing left to
+/// reclaim and locked up hard, with one tranche stalled 115 s. That is the
+/// whole-VMA pin the window resolver exists to prevent, reached by budget
+/// instead of by window size. Spans past the budget decline to the CPU scatter
+/// path, which is slow but survivable; pinning past what the host can spare is
+/// not.
+const HOST_IMPORT_MAX_WINDOWS: u64 = 16;
+const HOST_IMPORT_TOTAL_BYTE_CAP: u64 = HOST_IMPORT_WINDOW_CAP * HOST_IMPORT_MAX_WINDOWS;
+
+// A one-window budget is spent by the first import, so no second bucket can ever
+// resolve. Gate it at compile time, not just in a test.
+const _: () = assert!(HOST_IMPORT_MAX_WINDOWS > 1);
 
 fn host_import_budget(
     region_count: usize,
@@ -230,6 +271,43 @@ fn host_import_budget(
         return Err(HostImportDecline::TotalBytes);
     }
     Ok(())
+}
+
+/// Which regions to evict, coldest first, so `candidate_bytes` fits under both
+/// caps. `Some([])` means it already fits; `None` means it cannot fit even with
+/// the pool emptied, and the caller must decline.
+///
+/// Without this the budget is a lifetime one — `host_imports` only ever grew —
+/// so whichever buckets a boot happened to touch first held it forever and
+/// every later bucket fell to the CPU scatter path for the rest of the session.
+/// Measured on a 6 GiB x86 Ventura guest: the cap filled during login and
+/// `zc_fail_import` then climbed past 1100 per tranche.
+///
+/// Device-free so the policy is testable without a GPU; the caller owns the
+/// Vulkan teardown of whatever this names.
+fn host_import_eviction_plan(regions: &[(u64, u64)], candidate_bytes: u64) -> Option<Vec<usize>> {
+    if candidate_bytes > HOST_IMPORT_TOTAL_BYTE_CAP {
+        return None;
+    }
+    let mut live: u64 = regions.iter().map(|(len, _)| *len).sum();
+    let mut count = regions.len();
+    if host_import_budget(count, live, candidate_bytes).is_ok() {
+        return Some(Vec::new());
+    }
+    // Coldest stamp first; ties break on index so the plan is deterministic.
+    let mut order: Vec<usize> = (0..regions.len()).collect();
+    order.sort_by_key(|&i| (regions[i].1, i));
+
+    let mut victims = Vec::new();
+    for index in order {
+        victims.push(index);
+        live = live.saturating_sub(regions[index].0);
+        count -= 1;
+        if host_import_budget(count, live, candidate_bytes).is_ok() {
+            return Some(victims);
+        }
+    }
+    None
 }
 
 fn terminal_host_import_error(
@@ -414,6 +492,14 @@ pub(crate) enum DeferredHandle {
     RenderPass(vk::RenderPass),
     ShaderModule(vk::ShaderModule),
     Sampler(vk::Sampler),
+    /// A guest-RAM window evicted from `host_imports` by the LRU/byte cap. An
+    /// in-flight or open-batch CB can still read through its buffer, so it
+    /// takes the same in-flight-safe deferral as every other destroy. Nothing
+    /// to recycle: the memory is an imported host pointer, not pool-owned.
+    HostImport {
+        buffer: vk::Buffer,
+        memory: vk::DeviceMemory,
+    },
 }
 
 impl ResourcePools {
@@ -461,6 +547,14 @@ impl ResourcePools {
             DeferredHandle::RenderPass(rp) => device.destroy_render_pass(rp, None),
             DeferredHandle::ShaderModule(s) => device.destroy_shader_module(s, None),
             DeferredHandle::Sampler(s) => device.destroy_sampler(s, None),
+            DeferredHandle::HostImport { buffer, memory } => {
+                // Order matters as everywhere else: the buffer is bound over
+                // this memory, and freeing it under a live buffer is UB. The
+                // memory is an imported host pointer — freeing it unpins the
+                // guest pages, it does not release them.
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
         }
     }
 }
@@ -959,9 +1053,10 @@ include!("host_import_and_teardown.rs");
 #[cfg(test)]
 mod host_import_budget_tests {
     use super::{
-        host_import_budget, host_scatter, present_stats_setup_decline, resolve_scatter_regions,
-        terminal_host_import_error, DrawError, HostImportDecline, PresentStatsSetup, VkCall, VkOp,
-        HOST_IMPORT_REGION_CAP, HOST_IMPORT_TOTAL_BYTE_CAP,
+        host_import_budget, host_import_eviction_plan, host_scatter, present_stats_setup_decline,
+        resolve_scatter_regions, terminal_host_import_error, DrawError, HostImportDecline,
+        PresentStatsSetup, VkCall, VkOp, HOST_IMPORT_MAX_WINDOWS, HOST_IMPORT_REGION_CAP,
+        HOST_IMPORT_TOTAL_BYTE_CAP, HOST_IMPORT_WINDOW_CAP,
     };
     use crate::observe::Decline;
     use ash::vk;
@@ -1076,6 +1171,81 @@ mod host_import_budget_tests {
         assert_eq!(
             host_import_budget(1, HOST_IMPORT_TOTAL_BYTE_CAP, 1),
             Err(HostImportDecline::TotalBytes)
+        );
+    }
+
+    /// The budget is a lifetime one (`host_imports` is append-only until
+    /// teardown), so a total cap equal to one window lets the first import spend
+    /// it outright: every later bucket declines `host_import_total_byte_cap` and
+    /// the guest runs the whole boot on the CPU scatter path. Consecutive
+    /// maximum-size windows must fit, or the window resolver's "handful of
+    /// windows" steady state cannot occur.
+    #[test]
+    fn the_byte_cap_admits_consecutive_maximum_size_windows() {
+        for window in 1..HOST_IMPORT_MAX_WINDOWS {
+            assert_eq!(
+                host_import_budget(
+                    window as usize,
+                    HOST_IMPORT_WINDOW_CAP * window,
+                    HOST_IMPORT_WINDOW_CAP
+                ),
+                Ok(()),
+                "window {window} must still fit under the byte cap"
+            );
+        }
+        assert_eq!(
+            host_import_budget(
+                HOST_IMPORT_MAX_WINDOWS as usize,
+                HOST_IMPORT_WINDOW_CAP * HOST_IMPORT_MAX_WINDOWS,
+                HOST_IMPORT_WINDOW_CAP
+            ),
+            Err(HostImportDecline::TotalBytes),
+            "the cap must still bound pinning past the admitted windows"
+        );
+    }
+
+    /// The eviction policy is what turns the caps from a lifetime budget into a
+    /// working-set one. Coldest first, only as many as the candidate needs, and
+    /// a refusal only when the pool cannot hold it at all.
+    #[test]
+    fn eviction_frees_the_coldest_windows_and_only_as_many_as_needed() {
+        let full: Vec<(u64, u64)> = (0..HOST_IMPORT_MAX_WINDOWS)
+            .map(|i| (HOST_IMPORT_WINDOW_CAP, HOST_IMPORT_MAX_WINDOWS - i))
+            .collect();
+
+        // Room to spare: nothing is given up.
+        assert_eq!(
+            host_import_eviction_plan(&full[..1], HOST_IMPORT_WINDOW_CAP),
+            Some(Vec::new())
+        );
+
+        // Full pool, one window wanted: exactly the coldest stamp leaves, which
+        // is the last entry here — proving the plan follows `last_used` and not
+        // insertion order.
+        assert_eq!(
+            host_import_eviction_plan(&full, HOST_IMPORT_WINDOW_CAP),
+            Some(vec![full.len() - 1])
+        );
+
+        // A candidate worth two windows takes the two coldest, not the pool.
+        let plan = host_import_eviction_plan(&full, 2 * HOST_IMPORT_WINDOW_CAP)
+            .expect("two windows fit under the cap");
+        assert_eq!(plan, vec![full.len() - 1, full.len() - 2]);
+
+        // Past the cap no amount of eviction helps — the caller must decline
+        // rather than empty the pool for a request that still will not fit.
+        assert_eq!(
+            host_import_eviction_plan(&full, HOST_IMPORT_TOTAL_BYTE_CAP + 1),
+            None
+        );
+
+        // The count cap alone can force an eviction even when bytes are free.
+        let tiny: Vec<(u64, u64)> = (0..HOST_IMPORT_REGION_CAP)
+            .map(|i| (0x1000, (HOST_IMPORT_REGION_CAP - i) as u64))
+            .collect();
+        assert_eq!(
+            host_import_eviction_plan(&tiny, 0x1000),
+            Some(vec![tiny.len() - 1])
         );
     }
 

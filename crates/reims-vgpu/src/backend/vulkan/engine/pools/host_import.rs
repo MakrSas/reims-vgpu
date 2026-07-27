@@ -11,11 +11,19 @@
 /// Importing registers (pins) host pages for GPU DMA — importing the whole
 /// QEMU RAMBlock VMA (16 GiB+) pins the guest's entire RAM on the host for
 /// the VM lifetime. The driver accepts it, but the host pays gigabytes of
-/// locked memory. 1 GiB windows bound the pinning while keeping the
-/// amortization: spans bucket into VMA-relative aligned windows, so steady
-/// state reuses a handful of windows instead of importing per span.
+/// locked memory. Windows bound the pinning while keeping the amortization:
+/// spans bucket into VMA-relative aligned windows, so steady state reuses a
+/// handful of windows instead of importing per span.
 /// Standing rule (AGENTS.md): never raise this back to whole-VMA.
-pub(super) const HOST_IMPORT_WINDOW_CAP: u64 = 1 << 30;
+///
+/// The window size is what the byte budget buys coverage in. A touched page
+/// pulls its whole bucket, so an oversized window spends the budget on the
+/// cold span surrounding each touched page: at 1 GiB a 6 GiB x86 guest spent a
+/// 4 GiB budget on four buckets and still declined a fifth. 256 MiB buys four
+/// times the distinct hot regions for the same pinned bytes, and stays a
+/// multiple of every `minImportedHostPointerAlignment` in the support matrix
+/// (4 KiB / 16 KiB guest pages).
+pub(super) const HOST_IMPORT_WINDOW_CAP: u64 = 256 << 20;
 
 /// Compute the capped import window inside `[vma_base, vma_base+vma_len)`
 /// covering `[ptr, end)`: the `HOST_IMPORT_WINDOW_CAP`-aligned bucket
@@ -208,9 +216,9 @@ mod host_import_window_tests {
         assert_eq!(super::vma_bounds(0x1000), None);
     }
 
-    /// With real bounds a single guest page buckets into a 1 GiB window instead of
-    /// its own 16 KiB region — the property whose absence walked the region cap.
-    /// 16 KiB is the arm64 guest page (`PAGE_SIZE_ARM64E`).
+    /// With real bounds a single guest page buckets into a whole window instead
+    /// of its own 16 KiB region — the property whose absence walked the region
+    /// cap. 16 KiB is the arm64 guest page (`PAGE_SIZE_ARM64E`).
     #[test]
     fn one_guest_page_buckets_into_a_window_rather_than_its_own_region() {
         const GUEST_PAGE: u64 = 0x4000;
@@ -222,19 +230,25 @@ mod host_import_window_tests {
             "a page must pull a whole window"
         );
         assert!(base <= ptr && (ptr as u64) < base as u64 + len);
-        // 512 such spans scattered across a 16 GiB VMA land in at most 16 windows,
-        // where the per-span fallback made 512 regions.
+        // 512 spans strided across the whole VMA collapse to one region per
+        // bucket they land in — never one per span, which is what walked the
+        // region cap. The bound follows the window size rather than fixing a
+        // count, so it holds when the cap is retuned.
+        const STRIDE: usize = 0x0200_0000;
         let windows: std::collections::BTreeSet<usize> = (0..512)
             .map(|i| {
-                let p = VMA_BASE + i * 0x0200_0000;
+                let p = VMA_BASE + i * STRIDE;
                 capped_import_window(VMA_BASE, VMA_LEN, p, p as u64 + GUEST_PAGE, ALIGN).0
             })
             .collect();
+        let spanned = (512 * STRIDE as u64).min(VMA_LEN);
         assert!(
-            windows.len() <= 16,
-            "512 scattered pages must not need 512 regions, got {}",
-            windows.len()
+            (windows.len() as u64) <= spanned.div_ceil(HOST_IMPORT_WINDOW_CAP),
+            "scattered pages must collapse into their buckets, got {} for {} bytes at {HOST_IMPORT_WINDOW_CAP:#x}",
+            windows.len(),
+            spanned
         );
+        assert!(windows.len() < 512, "one region per span is the bug");
     }
 
     const ALIGN: u64 = 0x1000;
@@ -255,10 +269,11 @@ mod host_import_window_tests {
         assert_eq!((base, len), (VMA_BASE, HOST_IMPORT_WINDOW_CAP));
     }
 
-    /// A span inside a big VMA gets its 1 GiB bucket, never the whole VMA.
+    /// A span inside a big VMA gets its own bucket, never the whole VMA.
     #[test]
     fn big_vma_is_capped_to_bucket() {
-        let ptr = VMA_BASE + 0x1_2345_6000; // inside bucket 4 (16 GiB VMA)
+        // Bucket 4 of the 16 GiB VMA, offset well inside it at any window size.
+        let ptr = VMA_BASE + (4 * HOST_IMPORT_WINDOW_CAP) as usize + 0x345_6000;
         let (base, len) =
             capped_import_window(VMA_BASE, VMA_LEN, ptr, ptr as u64 + 0x80_0000, ALIGN);
         assert_eq!(base as u64, VMA_BASE as u64 + 4 * HOST_IMPORT_WINDOW_CAP);

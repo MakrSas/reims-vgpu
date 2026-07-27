@@ -68,11 +68,16 @@ impl ResourcePools {
             crate::observe::Emit::decline("host_import_fail", &reason).fail_once(0);
             return None;
         };
+        self.host_import_clock = self.host_import_clock.wrapping_add(1);
+        let now = self.host_import_clock;
         if let Some(r) = self
             .host_imports
-            .iter()
+            .iter_mut()
             .find(|r| r.base as u64 <= ptr as u64 && end <= r.base as u64 + r.len)
         {
+            // Stamp on hit: eviction reads these, so a window the guest keeps
+            // touching must not look as cold as one abandoned after boot.
+            r.last_used = now;
             return Some((r.buffer, ptr as u64 - r.base as u64));
         }
         let align = ctx.min_imported_host_pointer_alignment.max(1);
@@ -105,15 +110,45 @@ impl ResourcePools {
             if let Err(reason) =
                 host_import_budget(self.host_imports.len(), imported_bytes, region_len)
             {
-                if self.host_import_first_time(reason) {
-                    crate::observe::Emit::decline("host_import_fail", &reason)
-                        .field("regions", self.host_imports.len())
-                        .field("imported_bytes", format!("{imported_bytes:#x}"))
-                        .field("candidate_bytes", format!("{region_len:#x}"))
-                        .field("cap", format!("{HOST_IMPORT_TOTAL_BYTE_CAP:#x}"))
-                        .fail();
+                // The budget binds a working set, not a lifetime: make room by
+                // dropping the coldest windows rather than refusing every new
+                // bucket for the rest of the session.
+                let stamps: Vec<(u64, u64)> = self
+                    .host_imports
+                    .iter()
+                    .map(|region| (region.len, region.last_used))
+                    .collect();
+                let Some(victims) = host_import_eviction_plan(&stamps, region_len) else {
+                    if self.host_import_first_time(reason) {
+                        crate::observe::Emit::decline("host_import_fail", &reason)
+                            .field("regions", self.host_imports.len())
+                            .field("imported_bytes", format!("{imported_bytes:#x}"))
+                            .field("candidate_bytes", format!("{region_len:#x}"))
+                            .field("cap", format!("{HOST_IMPORT_TOTAL_BYTE_CAP:#x}"))
+                            .fail();
+                    }
+                    return None;
+                };
+                // Descending so each removal leaves the lower indices valid.
+                let mut ordered = victims;
+                ordered.sort_unstable_by(|a, b| b.cmp(a));
+                for index in ordered {
+                    let region = self.host_imports.remove(index);
+                    crate::observe::off(format!(
+                        "host_import_evict base={:#x} len={:#x} last_used={} regions={}",
+                        region.base,
+                        region.len,
+                        region.last_used,
+                        self.host_imports.len()
+                    ));
+                    self.dispose(
+                        &ctx.device,
+                        DeferredHandle::HostImport {
+                            buffer: region.buffer,
+                            memory: region.memory,
+                        },
+                    );
                 }
-                return None;
             }
             let memory = match ctx.import_host_ptr(base as *mut std::ffi::c_void, region_len) {
                 Ok(memory) => memory,
@@ -155,6 +190,7 @@ impl ResourcePools {
                 len: region_len,
                 memory,
                 buffer,
+                last_used: now,
             });
             let r = self.host_imports.last().unwrap();
             return Some((r.buffer, ptr as u64 - r.base as u64));

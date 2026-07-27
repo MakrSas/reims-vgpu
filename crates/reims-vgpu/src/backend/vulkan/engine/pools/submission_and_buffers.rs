@@ -53,6 +53,7 @@ impl ResourcePools {
             storage_recycle_admits: 0,
             storage_recycle_cap_drops: 0,
             host_imports: Vec::new(),
+            host_import_clock: 0,
             host_import_count_cap_logged: false,
             host_import_zero_len_logged: false,
             host_import_no_ext_logged: false,
