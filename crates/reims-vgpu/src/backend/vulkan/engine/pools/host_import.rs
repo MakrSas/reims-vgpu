@@ -16,14 +16,24 @@
 /// handful of windows instead of importing per span.
 /// Standing rule (AGENTS.md): never raise this back to whole-VMA.
 ///
-/// The window size is what the byte budget buys coverage in. A touched page
-/// pulls its whole bucket, so an oversized window spends the budget on the
-/// cold span surrounding each touched page: at 1 GiB a 6 GiB x86 guest spent a
-/// 4 GiB budget on four buckets and still declined a fifth. 256 MiB buys four
-/// times the distinct hot regions for the same pinned bytes, and stays a
-/// multiple of every `minImportedHostPointerAlignment` in the support matrix
-/// (4 KiB / 16 KiB guest pages).
-pub(super) const HOST_IMPORT_WINDOW_CAP: u64 = 256 << 20;
+/// Prefer few large windows over many small ones. A touched page pulls its
+/// whole bucket, so a smaller window looks like it should buy more distinct hot
+/// regions for the same pinned bytes — but every live import is a buffer the
+/// kernel revalidates on **each** queue submit, and userptr imports are the
+/// expensive kind. Measured on RADV (Renoir) with a 4 GiB budget held constant,
+/// same guest, same workload:
+///
+/// | window | live regions | `engine_submit_us` per submit |
+/// |---|---|---|
+/// | 256 MiB | 16 | ~41 ms |
+/// | 1 GiB | 4 | ~4.1 ms |
+///
+/// Submission fell from 77% of the tranche to 45%, and the tranche from ~30 to
+/// ~4.9 ms per draw. Coverage is the byte cap's job; the window size is what
+/// the submit path pays for, so keep it at the coarse end of what the caps
+/// allow. 1 GiB is also a multiple of every `minImportedHostPointerAlignment`
+/// in the support matrix (4 KiB / 16 KiB guest pages).
+pub(super) const HOST_IMPORT_WINDOW_CAP: u64 = 1 << 30;
 
 /// Compute the capped import window inside `[vma_base, vma_base+vma_len)`
 /// covering `[ptr, end)`: the `HOST_IMPORT_WINDOW_CAP`-aligned bucket

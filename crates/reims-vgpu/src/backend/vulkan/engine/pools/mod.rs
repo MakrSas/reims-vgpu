@@ -240,9 +240,11 @@ const HOST_IMPORT_REGION_CAP: usize = 512;
 /// the window resolver's documented steady state ("a handful of windows") needs
 /// a budget of more than one to exist at all.
 ///
-/// Sixteen 256 MiB windows hold the pinning at 4 GiB — the same total the
-/// 1 GiB-window budget allowed, spent on four times as many distinct hot
-/// regions.
+/// Four windows hold the pinning at 4 GiB. Coverage is this cap's job, not the
+/// window size's: a finer window spends the same bytes on more distinct buckets
+/// but leaves more live imports for the kernel to revalidate on every submit,
+/// which cost an order of magnitude more than it bought (see
+/// [`HOST_IMPORT_WINDOW_CAP`]).
 ///
 /// What must not grow is the product. Raising the budget to cover a guest's
 /// whole RAM (six 1 GiB windows against a 6 GiB x86 guest) pinned the entire
@@ -252,7 +254,7 @@ const HOST_IMPORT_REGION_CAP: usize = 512;
 /// instead of by window size. Spans past the budget decline to the CPU scatter
 /// path, which is slow but survivable; pinning past what the host can spare is
 /// not.
-const HOST_IMPORT_MAX_WINDOWS: u64 = 16;
+const HOST_IMPORT_MAX_WINDOWS: u64 = 4;
 const HOST_IMPORT_TOTAL_BYTE_CAP: u64 = HOST_IMPORT_WINDOW_CAP * HOST_IMPORT_MAX_WINDOWS;
 
 // A one-window budget is spent by the first import, so no second bucket can ever
